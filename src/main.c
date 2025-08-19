@@ -6,48 +6,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include "main.h"
 #include "ctmp.h"
+#include "listener.h"
+
 
 int main() {
-    int src_listen_fd, src_client_fd;
-    struct sockaddr_in src_listen_addr;
-    const int opt = 1;
 
-    // AF_INET = IPv4
-    // SOCK_STREAM = TCP
-    // 0 = IPPROTO_TCP (implied)
-    if ((src_listen_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        // any negative int = error/unexpected behaviour
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+    int src_listen_fd = init_tcp_listener(SRC_PORT);
+    int src_client_fd;
 
-    // allow reuse of socket
-    // not secure in prod, TIME_WAIT should be respected
-    if (setsockopt(src_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
+    int dst_listen_fd = init_tcp_listener(DST_PORT);
+    int dst_client_fd;
 
-    src_listen_addr.sin_family = AF_INET;
-    src_listen_addr.sin_addr.s_addr = INADDR_ANY; // all interfaces
-    src_listen_addr.sin_port = htons(PORT); // convert to network byte order
-
-    // bind to addr and port
-    if (bind(src_listen_fd, (struct sockaddr *) &src_listen_addr, sizeof(src_listen_addr)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // passive, wait for src, max 1 src
-    if (listen(src_listen_fd, 1) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Proxy is listening on port %d\n", PORT);
     printf("Waiting for a connection...\n");
 
     // accept incoming
@@ -57,7 +28,14 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    printf("Connection accepted!\n");
+    printf("Source connection accepted! Waiting on destination connection...\n");
+
+    if ((dst_client_fd = accept(dst_listen_fd, NULL, NULL)) < 0) {
+        perror("accept");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Destination connection accepted!\n");
 
     ctmp_header header;
     // read
@@ -82,6 +60,12 @@ int main() {
 
         buffer[data_read] = '\0';
         printf("Read from source (%zd) bytes: %s\n", data_read, buffer);
+
+        printf("Message received, forwarding to destination...");
+        write(dst_client_fd, &header, sizeof(ctmp_header));
+        write(dst_client_fd, buffer, data_read);
+        printf("Done!\n");
+
     } else if (bytes_read == 0) {
         printf("Source disconnected!\n");
     } else {
@@ -91,6 +75,8 @@ int main() {
     // close connections
     close(src_client_fd);
     close(src_listen_fd);
+    close(dst_client_fd);
+    close(dst_listen_fd);
 
     printf("Proxy exiting...\n");
     return 0;

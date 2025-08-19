@@ -1,0 +1,53 @@
+//
+// Created by raven on 19/08/2025.
+//
+
+#include "listener.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+
+int init_tcp_listener(int port) {
+    int listen_fd;
+    struct sockaddr_in listen_addr;
+    const int opt = 1;
+
+    // AF_INET = IPv4
+    // SOCK_STREAM = TCP
+    // 0 = IPPROTO_TCP (implied)
+    if ((listen_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        // any negative int = error/unexpected behaviour
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // allow reuse of socket
+    // not secure in prod, TIME_WAIT should be respected
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_addr.s_addr = INADDR_ANY; // all interfaces
+    listen_addr.sin_port = htons(port); // convert to network byte order
+
+    // bind to addr and port
+    if (bind(listen_fd, (struct sockaddr *) &listen_addr, sizeof(listen_addr)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // passive, wait for src, max 1 src
+    if (listen(listen_fd, 1) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Proxy is listening on port %d\n", port);
+
+    return listen_fd;
+}

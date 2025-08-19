@@ -7,14 +7,12 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-
-#define PORT 33333
-#define BUFFER_SIZE 1024
+#include "main.h"
+#include "ctmp.h"
 
 int main() {
     int proxy_fd, src_fd;
     struct sockaddr_in proxy_addr;
-    char buffer[BUFFER_SIZE + 1] = {0}; // +1 to allow null terminator for now to avoid unsafety with string funcs
     const int opt = 1;
 
     // AF_INET = IPv4
@@ -61,11 +59,29 @@ int main() {
 
     printf("Connection accepted!\n");
 
+    ctmp_header header;
     // read
-    ssize_t bytes_read = read(src_fd, buffer, BUFFER_SIZE);
+    //ssize_t bytes_read = read(src_fd, buffer, BUFFER_SIZE);
+    ssize_t bytes_read = read(src_fd, &header, sizeof(ctmp_header));   // for robustness, need to loop read realistically, for now just drop if we don't get sufficient bytes for simplicity
     if (bytes_read > 0) {
-        buffer[bytes_read] = '\0';
-        printf("Read from source: %s\n", buffer);
+        if (bytes_read != sizeof(ctmp_header)) {
+            perror("header read failed (insufficient bytes)");
+        } else {
+            int validity = is_header_valid(&header);
+
+            printf("MAGIC: 0x%02X\n", header.magic);
+            printf("PADDING_A: 0x%02X\n", header.mpad);
+            printf("LENGTH: %hu\n", header.length);
+            printf("PADDING_B: 0x%08X\n", header.lpad);
+            printf("VALIDITY: %d\n", validity);
+        }
+
+        char buffer[header.length + 1]; // +1 to allow null terminator for now to avoid unsafety with string funcs
+
+        ssize_t data_read =  read(src_fd, &buffer, header.length);
+
+        buffer[data_read] = '\0';
+        printf("Read from source (%zd) bytes: %s\n", data_read, buffer);
     } else if (bytes_read == 0) {
         printf("Source disconnected!\n");
     } else {

@@ -32,7 +32,7 @@ ssize_t readn(const int fd, void *buffer, const ssize_t expected_bytes) {
                 continue;
             }
 
-            perror("readn");
+            fprintf(stderr, "[readn] Error reading: %s\n", strerror(errno));
             return -1; // anything else is unrecoverable
         }
 
@@ -55,7 +55,7 @@ ssize_t writen(const int fd, const void *buffer, const ssize_t expected_bytes) {
                 continue;
             }
 
-            perror("writen");
+            fprintf(stderr, "[writen] Error writing via fd %d: %s\n", fd, strerror(errno));
             return -1;
         }
 
@@ -88,10 +88,9 @@ int main() {
 
     while (num_dsts < MAX_DSTS) {
         const int new_dst = accept(dst_listen_fd, NULL, NULL);
-        printf("Return value of accept was %d for dst %d", new_dst, num_dsts + 1);
+
         if (new_dst < 0) {
-            printf("Failed to accept connection from dst %d\n", num_dsts + 1);
-            perror("failed to accept connection");
+            fprintf(stderr, "Failed to accept connection from dst %d: %s\n", num_dsts + 1, strerror(errno));
             continue;
         }
 
@@ -107,7 +106,7 @@ int main() {
     const int src_listen_fd = init_tcp_listener(SRC_PORT, 1);
     int src_client_fd;
     if ((src_client_fd = accept(src_listen_fd, NULL, NULL)) < 0) {
-        perror("accept");
+        fprintf(stderr, "Failed to accept connection from src %d: %s\n", src_client_fd, strerror(errno));
         exit(EXIT_FAILURE);
     }
 
@@ -116,7 +115,20 @@ int main() {
     ctmp_header header;
 
     while (on_state) {
-        printf("Waiting for next message...");
+        int c;
+        for (c = 0; c < num_dsts; c++) {
+            if (dst_client_fds[c] != -1) {
+                break; // found active dst
+            }
+        }
+
+        if (c == num_dsts) {  // no active dsts
+//        if (num_dsts == 0) {
+            printf("INFO: No connected destinations, shutting down...\n");  // with current model, no point continually listening for msgs with nowhere to send them
+            exit(EXIT_SUCCESS);  // not strictly a failure I suppose?
+        }
+
+        printf("Waiting for next message...\n");
         // 0 out contents so garbage data doesn't get transmitted
         // matters less for header given fixed length etc, but data read B being shorter than data read A could result in leftover data
         // garbage data bad generally in this implementation, but also potentially dangerous in future potential where new dst connects between A and B and was not intended to receive any of A
@@ -127,9 +139,14 @@ int main() {
         const ssize_t bytes_read = readn(src_client_fd, &header, sizeof(ctmp_header));
         if (bytes_read > 0) {
             if (bytes_read != sizeof(ctmp_header)) {
-                perror("header read failed (insufficient bytes)");
+                fprintf(stderr, "Failed to read CTMP header (wrong number of bytes: expected %zd bytes, got %zd bytes)\n", sizeof(ctmp_header), bytes_read);
                 exit(EXIT_FAILURE);
             }
+
+            printf("MAGIC: 0x%02X\n", header.magic);
+            printf("PADDING_A: 0x%02X\n", header.mpad);
+            printf("LENGTH: %hu\n", header.length);
+            printf("PADDING_B: 0x%08X\n", header.lpad);
 
             const int validity = is_header_valid(&header);
             if (validity != 1) {
@@ -140,15 +157,11 @@ int main() {
                 //      esp difficult since protocol the spec does not define a delineation of the end of a msg
                 //   - there's a potential edge case in which a protocol violation is not detected until much later down the line (or perhaps not at all!)
                 //      this is since proxy's msg A could finish with source msg B's header, and proxy's msg B then starts with source msg B's data with a valid CTMP header
-                perror("header validity failed");
+                fprintf(stderr, "Invalid CTMP header\n");
                 exit(EXIT_FAILURE); // exit since there's no reasonable way to recover predictably
             }
 
-            printf("MAGIC: 0x%02X\n", header.magic);
-            printf("PADDING_A: 0x%02X\n", header.mpad);
-            printf("LENGTH: %hu\n", header.length);
-            printf("PADDING_B: 0x%08X\n", header.lpad);
-            printf("VALIDITY: %d\n", validity);
+            printf("VALIDITY: YES\n");
 
             const ssize_t data_read = readn(src_client_fd, buffer, header.length);
             if (data_read >= 0) {
@@ -156,25 +169,55 @@ int main() {
                 if (data_read != header.length) {
                     // don't read more than specified in the header length
                     // previous length+1 assumption doesn't hold easily since it puts the proxy in a potentially unpredictable state
-                    printf("warn: length specified as %hu bytes, read %zd bytes\n", header.length, data_read);
-                    perror("data read failed");
+                    fprintf(stderr, "Source sent insufficient bytes (length in header is %hu, got %zd bytes)\n", header.length, data_read);
                     exit(EXIT_FAILURE);  // treat as unrecoverable and exit
                 }
                 buffer[data_read] = '\0';
                 printf("Read from source (%zd) bytes: %s\n", data_read, buffer);
 
-                printf("Message received, forwarding to destinations...\n");
+                printf("Message received, attempting to forward to destinations...\n");
 
                 for (int i = 0; i < num_dsts; i++) {
-                    printf("Sending to destination %d...", i + 1);
-                    writen(dst_client_fds[i], &header, sizeof(ctmp_header));  // handling for write fails?
-                    writen(dst_client_fds[i], buffer, data_read);
-                    printf("Done\n");
+                    if (dst_client_fds[i] == -1) {
+                        continue;
+                    }
+
+                    bool kill_dst = false;
+                    printf("Attempting to send to destination %d...\n", i + 1);
+
+                    const ssize_t head_written = writen(dst_client_fds[i], &header, sizeof(ctmp_header));
+
+                    if (head_written == sizeof(ctmp_header)) {  // writen --> network buffer --> assumed responsibility/reliability of delivery --> only picks up dead dst on following msg
+                        const ssize_t data_written = writen(dst_client_fds[i], buffer, data_read);
+                        if (data_written == data_read) {
+                            printf("Sent!\n");
+                        } else {
+                            kill_dst = true;
+                        }
+                    } else {
+                        kill_dst = true;
+                    }
+
+                    if (kill_dst) {  // dead destination, remove
+                        fprintf(stderr, "Failed to send message to dst %d, removing dead dst...\n", i + 1);
+                        close(dst_client_fds[i]);
+                        dst_client_fds[i] = -1;  // slightly less efficient but less annoying to read output
+                        /**
+                        if (i < num_dsts - 1) {  // order of the dst clients is in theory irrelevant, so swap last one up to earlier slot
+                            dst_client_fds[i] = dst_client_fds[num_dsts - 1];
+                            printf("INFO: Now treating dst %d as dst %d\n", num_dsts, i + 1);
+                        }
+
+                        i--;
+                        num_dsts--;
+                        **/
+
+                    }
                 }
                 
-                printf("Finished sending to all destinations!\n");
+                printf("Finished sending to all active destinations!\n");
             } else {
-                perror("read");
+                fprintf(stderr, "Error whilst reading data from source: %s\n", strerror(errno));
                 exit(EXIT_FAILURE);
             }
         } else if (bytes_read == 0) {
@@ -182,7 +225,7 @@ int main() {
             break;
         } else {
             // readn returning -1 --> unrecoverable error
-            perror("read");
+            fprintf(stderr, "Error whilst reading header from source: %s\n", strerror(errno));
             exit(EXIT_FAILURE);
         }
     }

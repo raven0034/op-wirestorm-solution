@@ -7,6 +7,11 @@
 
 #define SRC_PORT 33333
 #define DST_PORT 44444
-#define BUFFER_SIZE 65536
+#define BUFFER_SIZE 65535
+
+#define MAX_DSTS 100
+
+void int_handler(int sig);
+int main();
 
 #endif //MAIN_H

@@ -10,7 +10,7 @@
 #include <sys/socket.h>
 
 
-int init_tcp_listener(int port) {
+int init_tcp_listener(int port, int queue) {
     int listen_fd;
     struct sockaddr_in listen_addr;
     const int opt = 1;
@@ -41,8 +41,8 @@ int init_tcp_listener(int port) {
         exit(EXIT_FAILURE);
     }
 
-    // passive, wait for src, max 1 src
-    if (listen(listen_fd, 1) < 0) {
+    // passive wait
+    if (listen(listen_fd, queue) < 0) {
         perror("listen");
         exit(EXIT_FAILURE);
     }

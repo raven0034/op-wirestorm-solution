@@ -10,12 +10,65 @@
 
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
 
 #include "ctmp.h"
 #include "listener.h"
 
 
 volatile bool on_state = true;
+
+// derived from UNIX Network Programming Vol. 1, 3rd Edition
+// src can send data in fragments, which isn't sufficiently handled by a single read
+ssize_t readn(int fd, void *buffer, ssize_t expected_bytes) {
+    ssize_t bytes_read = 0;
+
+    while (bytes_read < expected_bytes) {
+        // move forward number of bytes read from buffer, read up to the remaining number of bytes in new call
+        ssize_t curr_num_bytes = read(fd, buffer + bytes_read, expected_bytes - bytes_read); // store number of bytes read this iteration
+
+        if (curr_num_bytes < 0) {
+            if (errno == EINTR) {  // just an interrupt ie continue reading
+                continue;
+            }
+
+            perror("readn");
+            return -1;  // anything else is unrecoverable
+        }
+
+        if (curr_num_bytes == 0) {
+            return bytes_read;  // consistent with read
+        }
+
+        bytes_read += curr_num_bytes;
+    }
+
+    return bytes_read;  // total read across all iterations - should match expected_bytes at this statement
+}
+
+ssize_t writen(int fd, const void *buffer, ssize_t expected_bytes) {
+    ssize_t bytes_written = 0;
+    while (bytes_written < expected_bytes) {
+        ssize_t curr_num_bytes = write(fd, buffer + bytes_written, expected_bytes - bytes_written);
+        if (curr_num_bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("writen");
+            return -1;
+        }
+
+        if (curr_num_bytes == 0) {
+            return bytes_written;
+        }
+
+        bytes_written += curr_num_bytes;
+    }
+
+    return bytes_written;
+}
+
 
 void int_handler(int sig) {
     printf("Received %d to respond to\n", sig);
@@ -90,12 +143,13 @@ int main() {
         memset(buffer, 0, sizeof(buffer));
 
         // read header from src
-        ssize_t bytes_read = read(src_client_fd, &header, sizeof(ctmp_header));   // for robustness, need to loop read realistically, for now just drop if we don't get sufficient bytes for simplicity
+        ssize_t bytes_read = readn(src_client_fd, &header, sizeof(ctmp_header));
         if (bytes_read > 0) {
             if (bytes_read != sizeof(ctmp_header)) {
-                perror("header read failed (insufficient bytes)");  // can't strictly rely on one read, ie later abstract out, for now just exit, simpler
+                perror("header read failed (insufficient bytes)");
                 exit(EXIT_FAILURE);
             }
+
             int validity = is_header_valid(&header);
             if (validity != 1) {
                 perror("header validity failed");  // for now, also exit
@@ -108,7 +162,7 @@ int main() {
             printf("PADDING_B: 0x%08X\n", header.lpad);
             printf("VALIDITY: %d\n", validity);
 
-            ssize_t data_read =  read(src_client_fd, buffer, header.length);
+            ssize_t data_read =  readn(src_client_fd, buffer, header.length);
             if (data_read >= 0) {  // possibly check against 0 byte sends before writing data - protocol doesn't specify they're disallowed, but it is redundant
                 if (data_read != header.length) {  // so currently, we don't read more than the length specified in the header
                                                     // the spec explicitly says to drop the message if the data exceeds the length specified - strat? suspect possibly read up to header.length + 1 - if it exceeds we don't need to care *how much* it exceeds by, ie 1 byte over is sufficient to tell
@@ -122,8 +176,8 @@ int main() {
 
                 for (int i = 0; i < num_dsts; i++) {
                     printf("Sending to destination %d...", i+1);
-                    write(dst_client_fds[i], &header, sizeof(ctmp_header));
-                    write(dst_client_fds[i], buffer, data_read);
+                    writen(dst_client_fds[i], &header, sizeof(ctmp_header));
+                    writen(dst_client_fds[i], buffer, data_read);
                     printf("Done\n");
                 }
 
@@ -137,8 +191,9 @@ int main() {
         } else if (bytes_read == 0) {
             printf("Source disconnected!\n");
             break;
-        } else {
+        } else { // readn returning -1 --> unrecoverable error
             perror("read");
+            exit(EXIT_FAILURE);
         }
     }
 

@@ -9,235 +9,385 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
+#include <signal.h>
+#include <time.h>
+#include <netinet/in.h>
 #include "main.h"
 #include "ctmp.h"
 #include "listener.h"
+#include "client.h"
 
 
 volatile bool on_state = true;
+src_client src = {.fd = -1};  // file descriptor -1 indicates no connection
+dst_client dsts[MAX_DSTS];  // MAX_DSTS set in main.h - reject dsts in excess of this
 
-// derived from UNIX Network Programming Vol. 1, 3rd Edition
-// src can send data in fragments, which isn't sufficiently handled by a single read
-ssize_t readn(const int fd, void *buffer, const ssize_t expected_bytes) {
-    ssize_t bytes_read = 0;
-
-    while (bytes_read < expected_bytes) {
-        // move forward number of bytes read from buffer, read up to the remaining number of bytes in new call
-        const ssize_t curr_num_bytes = read(fd, buffer + bytes_read, expected_bytes - bytes_read);
-        // store number of bytes read this iteration
-
-        if (curr_num_bytes < 0) {
-            if (errno == EINTR) {
-                // just an interrupt ie continue reading
-                continue;
-            }
-
-            fprintf(stderr, "[readn] Error reading: %s\n", strerror(errno));
-            return -1; // anything else is unrecoverable
-        }
-
-        if (curr_num_bytes == 0) {
-            return bytes_read; // consistent with read
-        }
-
-        bytes_read += curr_num_bytes;
+/**
+ * @brief Close a source client connection and deregister with epoll
+ *
+ * @param epoll_fd epoll file descriptor
+ * @param src source client to cleanup
+ */
+void close_src_client(int epoll_fd, src_client *src) {
+    if (src->fd != -1) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, src->fd, NULL);
+        close(src->fd);
+        *src = (src_client){0};  // 0 out for safety
+        src->fd = -1;
     }
-
-    return bytes_read; // total read across all iterations - should match expected_bytes at this statement
 }
 
-ssize_t writen(const int fd, const void *buffer, const ssize_t expected_bytes) {
-    ssize_t bytes_written = 0;
-    while (bytes_written < expected_bytes) {
-        const ssize_t curr_num_bytes = write(fd, buffer + bytes_written, expected_bytes - bytes_written);
-        if (curr_num_bytes < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            fprintf(stderr, "[writen] Error writing via fd %d: %s\n", fd, strerror(errno));
-            return -1;
-        }
-
-        if (curr_num_bytes == 0) {
-            return bytes_written;
-        }
-
-        bytes_written += curr_num_bytes;
+/**
+ * @brief Close a destination client connection and deregister with epoll
+ *
+ * @param epoll_fd epoll file descriptor
+ * @param dst destination client to cleanup
+ */
+void close_dst_client(int epoll_fd, dst_client *dst) {
+    if (dst->fd != -1) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dst->fd, NULL);
+        close(dst->fd);
+        *dst = (dst_client){0};
+        dst->fd = -1;
     }
-
-    return bytes_written;
 }
 
-
+/**
+ * @brief Cleanly handles shutdown
+ * 
+ * @param sig The signal received - for us SIGINT since CTRL-C
+ */
 void int_handler(int sig) {
-    printf("Received %d to respond to\n", sig);
+    printf("\nReceived %d to respond to\n", sig);
     on_state = false;
 }
 
 int main() {
-    int dst_listen_fd = init_tcp_listener(DST_PORT, MAX_DSTS);
-    // set max_dsts here (at the very least, for now) so that in case MAX_DSTS all connect almost instantaneously
-    // if left at 1 like src, a flood of dst connections can cause a race condition between accept and the kernel whereby some queued connections never wakeup accept to unblock it
-    // todo is look at select, poll, epoll
-    int dst_client_fds[MAX_DSTS];
-    int num_dsts = 0;
-    char buffer[BUFFER_SIZE + 1]; // allow null terminator
+    signal(SIGINT, int_handler); // handle ctrl-c
 
-    printf("Waiting for %d destination connections...\n", MAX_DSTS);
-
-    while (num_dsts < MAX_DSTS) {
-        const int new_dst = accept(dst_listen_fd, NULL, NULL);
-
-        if (new_dst < 0) {
-            fprintf(stderr, "Failed to accept connection from dst %d: %s\n", num_dsts + 1, strerror(errno));
-            continue;
-        }
-
-        printf("Accepted new destination client #%d (fd: %d)\n", num_dsts + 1, new_dst);
-        dst_client_fds[num_dsts] = new_dst;
-        num_dsts++;
+    for (int i = 0; i < MAX_DSTS; i++) {
+        dsts[i].fd = -1; // initialise each destination
     }
 
-    printf("%d destination connections accepted! Waiting on the source connection...\n", num_dsts);
+    int src_listen_fd = init_tcp_listener(SRC_PORT, 128);  // listen on :33333 or other specified port
+    // prev assumption doesn't work given we could get flooded with *bad* src connections - ie don't want kernel to reject legit src
+    // similar problem for small MAX_DSTS
+    int dst_listen_fd = init_tcp_listener(DST_PORT, 128);  // listen on :44444
+    set_non_block(src_listen_fd);  // changed to non-blocking so we can poll rather than waiting and doing things sequentially
+    set_non_block(dst_listen_fd);
 
-    // accept src
-    // blocking until connect
-    const int src_listen_fd = init_tcp_listener(SRC_PORT, 1);
-    int src_client_fd;
-    if ((src_client_fd = accept(src_listen_fd, NULL, NULL)) < 0) {
-        fprintf(stderr, "Failed to accept connection from src %d: %s\n", src_client_fd, strerror(errno));
+    int epoll_fd = epoll_create1(0);  // file descriptor for polling
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
         exit(EXIT_FAILURE);
     }
 
-    printf("Source connection accepted! Waiting for messages from source...\n");
+    struct epoll_event event, events[MAX_DSTS + 3];  // capacity for MAX_DSTS destinations, 1 source, plus the 2 listeners
+    event.events = EPOLLIN;  // initially only care about reading - with no read we have no write
 
-    ctmp_header header;
+    event.data.ptr = &src_listen_fd;  // register src listener socket with epoll - fd readable -> incoming connection
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, src_listen_fd, &event);
+
+    event.data.ptr = &dst_listen_fd;  // same with dst
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dst_listen_fd, &event);
+
+    printf("Proxy started, waiting for events...\n");
 
     while (on_state) {
-        int c;
-        for (c = 0; c < num_dsts; c++) {
-            if (dst_client_fds[c] != -1) {
-                break; // found active dst
-            }
+        int num_events = epoll_wait(epoll_fd, events, MAX_DSTS + 3, 20);  // wait for new events, block for up to a reasonable time
+                                                                        // don't infinitely block so int_handler has an effect consistently
+
+        if (num_events < 0 && errno != EINTR) {
+            fprintf(stderr, "Unrecoverable error whilst polling: %s\n", strerror(errno));
+            perror("epoll_wait");
+            break; // unrecoverable state, exit, but cleanly
         }
 
-        if (c == num_dsts) {  // no active dsts
-//        if (num_dsts == 0) {
-            printf("INFO: No connected destinations, shutting down...\n");  // with current model, no point continually listening for msgs with nowhere to send them
-            exit(EXIT_SUCCESS);  // not strictly a failure I suppose?
-        }
+        for (int i = 0; i < num_events; i++) {
+            void *curr_fd_ptr = events[i].data.ptr;
 
-        printf("Waiting for next message...\n");
-        // 0 out contents so garbage data doesn't get transmitted
-        // matters less for header given fixed length etc, but data read B being shorter than data read A could result in leftover data
-        // garbage data bad generally in this implementation, but also potentially dangerous in future potential where new dst connects between A and B and was not intended to receive any of A
-        memset(&header, 0, sizeof(header));
-        memset(buffer, 0, sizeof(buffer));
+            // events for connections the src listener needs to handle
+            if (curr_fd_ptr == &src_listen_fd) {
+                while (true) {
+                    int src_fd = accept(src_listen_fd, NULL, NULL);
 
-        // read header from src
-        const ssize_t bytes_read = readn(src_client_fd, &header, sizeof(ctmp_header));
-        if (bytes_read > 0) {
-            if (bytes_read != sizeof(ctmp_header)) {
-                fprintf(stderr, "Failed to read CTMP header (wrong number of bytes: expected %zd bytes, got %zd bytes)\n", sizeof(ctmp_header), bytes_read);
-                exit(EXIT_FAILURE);
-            }
-
-            printf("MAGIC: 0x%02X\n", header.magic);
-            printf("PADDING_A: 0x%02X\n", header.mpad);
-            printf("LENGTH: %hu\n", header.length);
-            printf("PADDING_B: 0x%08X\n", header.lpad);
-
-            const int validity = is_header_valid(&header);
-            if (validity != 1) {
-                // this should cover most short read cases
-                // msg A claims 64 bytes, sends 56 bytes, some msg B of size >= 8 bytes fills out msg A, msg B gets detected as having a protocol violation --> kill
-                // two things are not ideal though:
-                //   - not sure there's a reasonable way to avoid transmitting a "bad" msg A before realising msg B is "bad"
-                //      esp difficult since protocol the spec does not define a delineation of the end of a msg
-                //   - there's a potential edge case in which a protocol violation is not detected until much later down the line (or perhaps not at all!)
-                //      this is since proxy's msg A could finish with source msg B's header, and proxy's msg B then starts with source msg B's data with a valid CTMP header
-                fprintf(stderr, "Invalid CTMP header\n");
-                exit(EXIT_FAILURE); // exit since there's no reasonable way to recover predictably
-            }
-
-            printf("VALIDITY: YES\n");
-
-            const ssize_t data_read = readn(src_client_fd, buffer, header.length);
-            if (data_read >= 0) {
-                // possibly check against 0 byte sends before writing data - protocol doesn't specify they're disallowed, but it is redundant
-                if (data_read != header.length) {
-                    // don't read more than specified in the header length
-                    // previous length+1 assumption doesn't hold easily since it puts the proxy in a potentially unpredictable state
-                    fprintf(stderr, "Source sent insufficient bytes (length in header is %hu, got %zd bytes)\n", header.length, data_read);
-                    exit(EXIT_FAILURE);  // treat as unrecoverable and exit
-                }
-                buffer[data_read] = '\0';
-                printf("Read from source (%zd) bytes: %s\n", data_read, buffer);
-
-                printf("Message received, attempting to forward to destinations...\n");
-
-                for (int i = 0; i < num_dsts; i++) {
-                    if (dst_client_fds[i] == -1) {
-                        continue;
+                    if (src_fd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;  // no more pending
+                        }
+                        
+                        fprintf(stderr, "Error accepting source connection: %s\n", strerror(errno));
+                        break;  // so we don't spin forever on errors
                     }
 
-                    bool kill_dst = false;
-                    printf("Attempting to send to destination %d...\n", i + 1);
+                    if (src.fd != -1) {
+                        fprintf(stderr, "Rejecting attempted source connection on fd %d (already have a connected source)\n", src_fd);
 
-                    const ssize_t head_written = writen(dst_client_fds[i], &header, sizeof(ctmp_header));
+                        close(src_fd);
 
-                    if (head_written == sizeof(ctmp_header)) {  // writen --> network buffer --> assumed responsibility/reliability of delivery --> only picks up dead dst on following msg
-                        const ssize_t data_written = writen(dst_client_fds[i], buffer, data_read);
-                        if (data_written == data_read) {
-                            printf("Sent!\n");
-                        } else {
-                            kill_dst = true;
+                    } else {
+                        set_non_block(src_fd);
+
+                        event = (struct epoll_event){0};
+                        event.events = EPOLLIN;
+                        event.data.ptr = &src;
+
+                        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, src_fd, &event);
+                        src = (src_client){.fd = src_fd};
+
+                        printf("Accepted new source client on fd %d\n", src_fd);
+                    }
+                }
+            
+            // events for connections the dst listener needs to handle    
+            } else if (curr_fd_ptr == &dst_listen_fd) {
+                while (true) {
+                    int dst_fd = accept(dst_listen_fd, NULL, NULL);
+                    if (dst_fd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {  // no more connections to accept, non-fatal
+                            break;
+                        }
+
+                        fprintf(stderr, "Failed to accept destination connection: %s\n", strerror(errno));
+                        break;
+                    }
+
+                    int j;
+                    for (j = 0; j < MAX_DSTS; j++) {
+                        if (dsts[j].fd == -1) {
+                            set_non_block(dst_fd);
+                            event = (struct epoll_event){0};
+
+                            event.events = EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+                            event.data.ptr = &dsts[j];
+
+                            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dst_fd, &event);
+
+                            dsts[j] = (dst_client){.fd = dst_fd, .last_active = time(NULL)};  // unsure if there's an edge case of dsts getting dc'ed from this when it's not their fault
+                            
+                            printf("Accepted new destination client on fd %d, slot %d\n", dsts[j].fd, j);
+                            break;
+                        }
+                    }
+
+                    if (j == MAX_DSTS) {
+                        fprintf(
+                            stderr,
+                            "Rejecting attempted destination connection on fd %d (max allowed destinations reached)\n",
+                            dst_fd);
+                        close(dst_fd);
+                    }
+                }
+            // incoming data from src    
+            } else if (curr_fd_ptr == &src && src.fd != -1) {
+                if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
+                    bool cleanup = false;
+
+                    while (src.bytes_in != BUFFER_SIZE) {  // drain buffer to reduce wakeups
+                        ssize_t count = read(
+                            src.fd,
+                            src.read_buffer + src.bytes_in,
+                            BUFFER_SIZE - src.bytes_in);
+
+                        if (count < 0) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK) {  // ie unrecoverable state, not that we just don't have more data to read right now
+                                fprintf(stderr, "Error reading from source on fd %d: %s\nClosing source connection...\n",
+                                        src.fd, strerror(errno));
+                                cleanup = true;
+                                break;
+                            }
+
+                            break; // drained
+                        }
+
+                        if (count == 0) {
+                            printf("Source client on fd %d disconnected\nCleaning up...\n", src.fd);
+                            cleanup = true;
+                            break;
+                        }
+
+                        src.bytes_in += count;
+                    }
+
+                    if (cleanup) {  // todo: refactor out
+                        close_src_client(epoll_fd, &src);
+                        //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, src.fd, NULL);
+                        //close(src.fd);
+                        //src = (src_client){0};
+                        //src.fd = -1;
+                    }
+                }
+            // outgoing data to dsts    
+            } else {
+                dst_client *dst = events[i].data.ptr;
+                bool cleanup = false;
+
+                if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {  // errored, hang up, half-close (close via peer, ie not writable)
+                    int soerr = 0;
+                    socklen_t len = sizeof(soerr);
+                    getsockopt(dst->fd, SOL_SOCKET, SO_ERROR, &soerr, &len);
+                    fprintf(stderr, "Destination on fd %d hung or disconnected (Status: %s)\nCleaning up...\n", dst->fd,
+                            strerror(soerr));
+                    cleanup = true;
+
+                } else if (events[i].events & EPOLLOUT) {
+                    while (dst->bytes_out != dst->bytes_left) {  // drain all that we can, to reduce wakeups needed - level triggered
+                        ssize_t count = write(dst->fd, dst->write_buffer + dst->bytes_out,
+                                              dst->bytes_left - dst->bytes_out);
+
+                        if (count < 0) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK) {  // actual error that isn't just no data currently
+                                fprintf(
+                                    stderr,
+                                    "Error writing to destination on fd %d: %s\nClosing destination connection...\n",
+                                    dst->fd, strerror(errno));
+                                cleanup = true;
+                                break;
+                            }
+
+                            break; // drained
+                        }
+
+                        dst->bytes_out += count;
+                    }
+                }
+
+                if (cleanup) {  // clean-up dsts that are in an unrecoverable state
+                    close_dst_client(epoll_fd, dst);
+                    //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dst->fd, NULL);
+                    //close(dst->fd);
+                    //*dst = (dst_client){0};
+                    //dst->fd = -1;
+
+                } else {
+                    if (dst->bytes_out == dst->bytes_left) {
+                        dst->bytes_out = 0;
+                        dst->bytes_left = 0;
+                    }
+
+                    if (dst->bytes_left > 0) {
+                        if (!(dst->prev_mask & EPOLLOUT)) { // only want to set EPOLLOUT on mask change
+                            struct epoll_event ev = {0};
+
+                            ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+                            ev.data.ptr = dst;
+
+                            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, dst->fd, &ev);
+                            dst->prev_mask |= EPOLLOUT;
                         }
                     } else {
-                        kill_dst = true;
-                    }
+                        // remove EPOLLOUT so we don't get redundant wake-ups
+                        if (dst->prev_mask & EPOLLOUT) {
+                            dst->last_active = time(NULL);
+                            struct epoll_event ev = {0};
 
-                    if (kill_dst) {  // dead destination, remove
-                        fprintf(stderr, "Failed to send message to dst %d, removing dead dst...\n", i + 1);
-                        close(dst_client_fds[i]);
-                        dst_client_fds[i] = -1;  // slightly less efficient but less annoying to read output
-                        /**
-                        if (i < num_dsts - 1) {  // order of the dst clients is in theory irrelevant, so swap last one up to earlier slot
-                            dst_client_fds[i] = dst_client_fds[num_dsts - 1];
-                            printf("INFO: Now treating dst %d as dst %d\n", num_dsts, i + 1);
+                            ev.events = EPOLLIN | EPOLLRDHUP;
+                            ev.data.ptr = dst;
+
+                            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, dst->fd, &ev);
+                            dst->prev_mask &= ~EPOLLOUT;
                         }
-
-                        i--;
-                        num_dsts--;
-                        **/
-
                     }
                 }
-                
-                printf("Finished sending to all active destinations!\n");
-            } else {
-                fprintf(stderr, "Error whilst reading data from source: %s\n", strerror(errno));
-                exit(EXIT_FAILURE);
             }
-        } else if (bytes_read == 0) {
-            printf("Source disconnected!\n");
-            break;
-        } else {
-            // readn returning -1 --> unrecoverable error
-            fprintf(stderr, "Error whilst reading header from source: %s\n", strerror(errno));
-            exit(EXIT_FAILURE);
+            
+            // enqueue
+            if (src.fd != -1) {
+                bool backpressure = false;
+                while (src.bytes_in >= sizeof(ctmp_header)) {
+                    ctmp_header *header = (ctmp_header *) src.read_buffer;
+
+                    if (!is_header_valid(header)) {
+                        fprintf(stderr, "Invalid header from src on fd %d, closing connection...\n", src.fd);
+                        
+                        close_src_client(epoll_fd, &src);
+                        //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, src.fd, NULL);
+                        //close(src.fd);
+                        //src = (src_client){0};
+                        //src.fd = -1;
+                        
+                        break;
+                    }
+
+                    size_t full_msg_len = sizeof(ctmp_header) + ntohs(header->length);  // convert length to host order so we set len correctly
+                    if (src.bytes_in >= full_msg_len) {
+                        // check for backpressure
+                        for (int j = 0; j < MAX_DSTS; j++) {
+                            if (dsts[j].fd != -1 && (BUFFER_SIZE - dsts[j].bytes_left < full_msg_len)) {
+                                backpressure = true;
+                                break;
+                            }
+                        }
+                        if (backpressure) break;  // don't consume more data from src to stop overflows
+
+                        // no bp --> no break --> we want to broadcast to each of the dsts
+                        for (int j = 0; j < MAX_DSTS; j++) {
+                            if (dsts[j].fd != -1) {
+                                memcpy(dsts[j].write_buffer + dsts[j].bytes_left, src.read_buffer, full_msg_len);
+                                dsts[j].bytes_left += full_msg_len;
+
+                                uint32_t new_mask = EPOLLIN | EPOLLOUT;
+                                if (new_mask != dsts[j].prev_mask) {
+                                    event = (struct epoll_event){0};
+
+                                    event.events = new_mask;
+                                    event.data.ptr = &dsts[j];
+
+                                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, dsts[j].fd, &event);
+                                    dsts[j].prev_mask = new_mask;
+                                }
+                            }
+                        }
+
+                        memmove(src.read_buffer, src.read_buffer + full_msg_len, src.bytes_in - full_msg_len);
+                        src.bytes_in -= full_msg_len;
+                    } else {
+                        break;
+                    }
+                }
+                // add/remove bp
+                uint32_t new_mask = backpressure ? EPOLLRDHUP : (EPOLLIN | EPOLLRDHUP);
+                if (new_mask != src.prev_mask) {
+                    event = (struct epoll_event){0};
+
+                    event.events = new_mask;
+                    event.data.ptr = &src;
+
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, src.fd, &event);
+                    src.prev_mask = new_mask;
+                }
+            }
+
+            // check for dead dst clients, and remove them if they've exceeded the timeout
+            // could also do for src, but less pertinent given single src
+            time_t now = time(NULL);
+            for (int l = 0; l < MAX_DSTS; l++) {
+                if (dsts[l].fd != -1 && dsts[l].bytes_left > 0) {
+                    if (now - dsts[l].last_active > CLIENT_TIMEOUT) {  // clean-up timed out clients - abstract out to its own method
+                        close_dst_client(epoll_fd, &dsts[l]);
+                        //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dsts[l].fd, NULL);
+                        //close(dsts[l].fd);
+                        //dsts[l] = (dst_client){0};
+                        //dsts[l].fd = -1;
+                    }
+                }
+            }
         }
     }
 
     // close connections
-    close(src_client_fd);
     close(src_listen_fd);
-    for (int j = 0; j < num_dsts; j++) {
-        close(dst_client_fds[j]);
-    }
     close(dst_listen_fd);
+    close(epoll_fd);
+    close(src.fd);
+
+    for (int j = 0; j < MAX_DSTS; j++) {
+
+        close(dsts[j].fd);
+
+    }
 
     printf("Proxy exiting...\n");
     return 0;
-}
+

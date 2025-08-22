@@ -10,7 +10,7 @@ int is_header_valid(const ctmp_header *header) {
     // separated returns to facilitate potential error codes later
 
     if (header->magic != 0xCC) {
-        return 0;
+        return 0;  // invalid if magic byte doesn't match
     }
 
     if (header->mpad != 0) {

@@ -7,9 +7,8 @@
 
 #define SRC_PORT 33333
 #define DST_PORT 44444
-#define BUFFER_SIZE 65535
 
-#define MAX_DSTS 2
+#define MAX_DSTS 50
 
 ssize_t readn(int fd, void *buffer, ssize_t expected_bytes);
 ssize_t writen(int fd, const void *buffer, ssize_t expected_bytes);

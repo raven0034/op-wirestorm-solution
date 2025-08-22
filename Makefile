@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=-Wall -Wextra -g
-LDFLAGS=-lpthread
+CFLAGS=-Wall -Wextra -O3 -march=native -flto -funroll-loops -ffast-math -Wall -Wextra -g0
+LDFLAGS=-s -flto
 
 EXEC=proxy
 BUILDDIR=./build
@@ -15,8 +15,8 @@ OBJS=$(SRCS:./src/%.c=$(BUILDDIR)/%.o)
 all: $(BINARY)
 
 clean:
-	rm $(BINARY)
-	rm -rf $(BUILDDIR)
+	[ -f $(BINARY) ] && rm $(BINARY)
+	[ -d $(BUILDDIR) ] && rm -rf $(BUILDDIR)
 
 $(BINARY): $(OBJS)
 	echo $(OBJS)

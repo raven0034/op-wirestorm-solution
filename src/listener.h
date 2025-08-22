@@ -5,6 +5,6 @@
 #ifndef LISTENER_H
 #define LISTENER_H
 
-int init_tcp_listener(int port, int pool);
+int init_tcp_listener(const char *ip, int port, int queue);
 
 #endif //LISTENER_H

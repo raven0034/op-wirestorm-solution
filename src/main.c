@@ -8,6 +8,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <signal.h>
@@ -24,62 +25,54 @@ src_client src = {.fd = -1};  // file descriptor -1 indicates no connection
 dst_client dsts[MAX_DSTS];  // MAX_DSTS set in main.h - reject dsts in excess of this
 
 /**
- * @brief Close a source client connection and deregister with epoll
- *
- * @param epoll_fd epoll file descriptor
- * @param src source client to cleanup
- */
-void close_src_client(int epoll_fd, src_client *src) {
-    if (src->fd != -1) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, src->fd, NULL);
-        close(src->fd);
-        *src = (src_client){0};  // 0 out for safety
-        src->fd = -1;
-    }
-}
-
-/**
- * @brief Close a destination client connection and deregister with epoll
- *
- * @param epoll_fd epoll file descriptor
- * @param dst destination client to cleanup
- */
-void close_dst_client(int epoll_fd, dst_client *dst) {
-    if (dst->fd != -1) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dst->fd, NULL);
-        close(dst->fd);
-        *dst = (dst_client){0};
-        dst->fd = -1;
-    }
-}
-
-/**
  * @brief Cleanly handles shutdown
  * 
  * @param sig The signal received - for us SIGINT since CTRL-C
  */
 void int_handler(int sig) {
-    printf("\nReceived %d to respond to\n", sig);
+    printf("\nReceived '%s' to respond to\n", strsignal(sig));
     on_state = false;
 }
 
-int main() {
+int main(int argc, char **argv) {
     signal(SIGINT, int_handler); // handle ctrl-c
+
+    char *ip = "127.0.0.1";
+    int src_port = SRC_PORT;
+    int dst_port = DST_PORT;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "i:s:d:")) != -1) {
+        switch (opt) {
+            case 'i':
+                ip = optarg;
+                break;
+            case 's':
+                src_port = atoi(optarg);
+                break;
+            case 'd':
+                dst_port = atoi(optarg);
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-i ip_address] [-s src_port] [-d dst_port]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
 
     for (int i = 0; i < MAX_DSTS; i++) {
         dsts[i].fd = -1; // initialise each destination
     }
 
-    int src_listen_fd = init_tcp_listener(SRC_PORT, 128);  // listen on :33333 or other specified port
+    int src_listen_fd = init_tcp_listener(ip, src_port, 128);  // listen on :33333 or other specified port
     // prev assumption doesn't work given we could get flooded with *bad* src connections - ie don't want kernel to reject legit src
     // similar problem for small MAX_DSTS
-    int dst_listen_fd = init_tcp_listener(DST_PORT, 128);  // listen on :44444
+    int dst_listen_fd = init_tcp_listener(ip, dst_port, 128);  // listen on :44444
     set_non_block(src_listen_fd);  // changed to non-blocking so we can poll rather than waiting and doing things sequentially
     set_non_block(dst_listen_fd);
 
     int epoll_fd = epoll_create1(0);  // file descriptor for polling
     if (epoll_fd == -1) {
-        perror("epoll_create1");
+        fprintf(stderr, "ERROR: Failed to create epoll instance: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
@@ -100,7 +93,6 @@ int main() {
 
         if (num_events < 0 && errno != EINTR) {
             fprintf(stderr, "Unrecoverable error whilst polling: %s\n", strerror(errno));
-            perror("epoll_wait");
             break; // unrecoverable state, exit, but cleanly
         }
 
@@ -110,7 +102,11 @@ int main() {
             // events for connections the src listener needs to handle
             if (curr_fd_ptr == &src_listen_fd) {
                 while (true) {
-                    int src_fd = accept(src_listen_fd, NULL, NULL);
+                    struct sockaddr_in peer_addr;
+                    socklen_t addr_len = sizeof(peer_addr);
+
+                    int src_fd = accept(src_listen_fd, (struct sockaddr*)&peer_addr, &addr_len);
+
 
                     if (src_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -121,12 +117,17 @@ int main() {
                         break;  // so we don't spin forever on errors
                     }
 
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &peer_addr.sin_addr, ip_str, sizeof(ip_str));
+                    uint16_t port = ntohs(peer_addr.sin_port);
+
                     if (src.fd != -1) {
-                        fprintf(stderr, "Rejecting attempted source connection on fd %d (already have a connected source)\n", src_fd);
+                        fprintf(stderr, "Rejecting attempted source connection on fd %d from %s:%d (already have a connected source)\n", src_fd, ip_str, port);
 
                         close(src_fd);
 
                     } else {
+
                         set_non_block(src_fd);
 
                         event = (struct epoll_event){0};
@@ -136,14 +137,17 @@ int main() {
                         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, src_fd, &event);
                         src = (src_client){.fd = src_fd};
 
-                        printf("Accepted new source client on fd %d\n", src_fd);
+                        printf("Accepted new source client on fd %d from %s:%d\n", src_fd, ip_str, port);
                     }
                 }
             
             // events for connections the dst listener needs to handle    
             } else if (curr_fd_ptr == &dst_listen_fd) {
                 while (true) {
-                    int dst_fd = accept(dst_listen_fd, NULL, NULL);
+                    struct sockaddr_in peer_addr;
+                    socklen_t addr_len = sizeof(peer_addr);
+
+                    int dst_fd = accept(dst_listen_fd, (struct sockaddr*)&peer_addr, &addr_len);
                     if (dst_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {  // no more connections to accept, non-fatal
                             break;
@@ -152,6 +156,10 @@ int main() {
                         fprintf(stderr, "Failed to accept destination connection: %s\n", strerror(errno));
                         break;
                     }
+                    
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &peer_addr.sin_addr, ip_str, sizeof(ip_str));
+                    uint16_t port = ntohs(peer_addr.sin_port);
 
                     int j;
                     for (j = 0; j < MAX_DSTS; j++) {
@@ -166,7 +174,7 @@ int main() {
 
                             dsts[j] = (dst_client){.fd = dst_fd, .last_active = time(NULL)};  // unsure if there's an edge case of dsts getting dc'ed from this when it's not their fault
                             
-                            printf("Accepted new destination client on fd %d, slot %d\n", dsts[j].fd, j);
+                            printf("Accepted new destination client on fd %d, slot %d from %s:%d\n", dsts[j].fd, j, ip_str, port);
                             break;
                         }
                     }
@@ -174,8 +182,8 @@ int main() {
                     if (j == MAX_DSTS) {
                         fprintf(
                             stderr,
-                            "Rejecting attempted destination connection on fd %d (max allowed destinations reached)\n",
-                            dst_fd);
+                            "Rejecting attempted destination connection on fd %d from %s:%d (max allowed destinations reached)\n",
+                            dst_fd, ip_str, port);
                         close(dst_fd);
                     }
                 }
@@ -184,7 +192,7 @@ int main() {
                 if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
                     bool cleanup = false;
 
-                    while (src.bytes_in != BUFFER_SIZE) {  // drain buffer to reduce wakeups
+                    while (src.bytes_in < BUFFER_SIZE) {  // drain buffer to reduce wakeups
                         ssize_t count = read(
                             src.fd,
                             src.read_buffer + src.bytes_in,
@@ -212,12 +220,9 @@ int main() {
 
                     if (cleanup) {  // todo: refactor out
                         close_src_client(epoll_fd, &src);
-                        //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, src.fd, NULL);
-                        //close(src.fd);
-                        //src = (src_client){0};
-                        //src.fd = -1;
                     }
                 }
+
             // outgoing data to dsts    
             } else {
                 dst_client *dst = events[i].data.ptr;
@@ -255,10 +260,6 @@ int main() {
 
                 if (cleanup) {  // clean-up dsts that are in an unrecoverable state
                     close_dst_client(epoll_fd, dst);
-                    //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dst->fd, NULL);
-                    //close(dst->fd);
-                    //*dst = (dst_client){0};
-                    //dst->fd = -1;
 
                 } else {
                     if (dst->bytes_out == dst->bytes_left) {
@@ -302,16 +303,27 @@ int main() {
                         fprintf(stderr, "Invalid header from src on fd %d, closing connection...\n", src.fd);
                         
                         close_src_client(epoll_fd, &src);
-                        //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, src.fd, NULL);
-                        //close(src.fd);
-                        //src = (src_client){0};
-                        //src.fd = -1;
                         
                         break;
                     }
 
                     size_t full_msg_len = sizeof(ctmp_header) + ntohs(header->length);  // convert length to host order so we set len correctly
-                    if (src.bytes_in >= full_msg_len) {
+
+                    if (src.bytes_in >= full_msg_len) { // checksum check is best here, can only do after accumulating full message
+                        if (header->options == CTMP_OPTION_SENSITIVE) {  // don't bother triggering any checksum check if flag isn't set
+                            if (!is_valid_checksum(header, (uint8_t *)(src.read_buffer + sizeof(ctmp_header)))) {
+                                fprintf(stderr, "Invalid checksum from src on fd %d\nClosing connection to src...", src.fd);
+
+                                close_src_client(epoll_fd, &src);  // usual thing of kill the connection if it's not trustworthy
+                                                                    // in a sense it *could* be argued that this is something that
+                                                                    // can reasonably be recovered from (after dropping), but at this
+                                                                    // point, why waste time and power if the src cannot honour the
+                                                                    // protocol and contract of trust?
+
+                                break;  // must break or it *will* segfault
+                            }
+                        }
+
                         // check for backpressure
                         for (int j = 0; j < MAX_DSTS; j++) {
                             if (dsts[j].fd != -1 && (BUFFER_SIZE - dsts[j].bytes_left < full_msg_len)) {
@@ -366,10 +378,6 @@ int main() {
                 if (dsts[l].fd != -1 && dsts[l].bytes_left > 0) {
                     if (now - dsts[l].last_active > CLIENT_TIMEOUT) {  // clean-up timed out clients - abstract out to its own method
                         close_dst_client(epoll_fd, &dsts[l]);
-                        //epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dsts[l].fd, NULL);
-                        //close(dsts[l].fd);
-                        //dsts[l] = (dst_client){0};
-                        //dsts[l].fd = -1;
                     }
                 }
             }
@@ -383,9 +391,7 @@ int main() {
     close(src.fd);
 
     for (int j = 0; j < MAX_DSTS; j++) {
-
         close(dsts[j].fd);
-
     }
 
     printf("Proxy exiting...\n");
